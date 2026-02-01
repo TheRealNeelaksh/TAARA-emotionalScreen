@@ -9,6 +9,10 @@ const EYE_SPACING = 140; // Distance between centers
 const LINE_WIDTH = 4;
 const LINE_MAX_CURVE = 20; // Max pixels the line curves up/down
 
+// WebSocket Config
+const WS_URL = "ws://localhost:8000/ws";
+const RECONNECT_DELAY = 3000;
+
 // Blink Config
 const BLINK_DURATION = 150;
 const MIN_BLINK_INTERVAL = 2000;
@@ -58,6 +62,107 @@ function resize() {
     canvas.width = width;
     canvas.height = height;
 }
+
+// --- Audio State ---
+let audioContext;
+let audioWorkletNode;
+let audioState = {
+    volume: 0, // Smoothed RMS
+    zcr: 0
+};
+
+async function initAudio() {
+    if (audioContext) return;
+
+    try {
+        audioContext = new AudioContext();
+        await audioContext.audioWorklet.addModule('audio-processor.js');
+
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const source = audioContext.createMediaStreamSource(stream);
+
+        audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+
+        audioWorkletNode.port.onmessage = (event) => {
+            const { rms, zcr } = event.data;
+
+            // Fast attack, slow release smoothing for volume
+            if (rms > audioState.volume) {
+                audioState.volume = lerp(audioState.volume, rms, 0.3); // Attack
+            } else {
+                audioState.volume = lerp(audioState.volume, rms, 0.05); // Release
+            }
+
+            audioState.zcr = zcr;
+
+            // Map Audio to Emotion
+            // Volume -> Target Arousal
+            const arousalTarget = Math.min(1.0, audioState.volume * 5.0);
+            if (arousalTarget > 0.1) {
+                state.emotion.targetArousal = Math.max(state.emotion.targetArousal, arousalTarget);
+                // Activity = slight positive valence (interested)
+                state.emotion.targetValence = lerp(state.emotion.targetValence, 0.2, 0.05);
+            }
+        };
+
+        source.connect(audioWorkletNode);
+        console.log("Audio initialized");
+
+        // Remove click handler
+        window.removeEventListener('click', initAudio);
+
+        // Visual feedback
+        state.emotion.targetArousal = 1.0;
+        setTimeout(() => state.emotion.targetArousal = 0, 300);
+
+    } catch (e) {
+        console.error("Audio init failed", e);
+    }
+}
+
+// --- WebSocket ---
+let socket;
+
+function connectWS() {
+    socket = new WebSocket(WS_URL);
+
+    socket.onopen = () => {
+        console.log("WebSocket connected");
+        // Test message
+        socket.send("Hello from Frontend!");
+    };
+
+    socket.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            console.log("WS Recv:", data);
+
+            if (data.delta_valence !== undefined) {
+                // Apply deltas
+                state.emotion.targetValence = Math.max(-1, Math.min(1, state.emotion.targetValence + data.delta_valence));
+            }
+            if (data.delta_arousal !== undefined) {
+                state.emotion.targetArousal = Math.max(0, Math.min(1, state.emotion.targetArousal + data.delta_arousal));
+            }
+            // If text is present, maybe trigger usage? For now, just logging.
+
+        } catch (e) {
+            console.error("WS Parse Error", e);
+        }
+    };
+
+    socket.onclose = () => {
+        console.log("WebSocket closed, reconnecting...");
+        setTimeout(connectWS, RECONNECT_DELAY);
+    };
+
+    socket.onerror = (err) => {
+        console.error("WebSocket error", err);
+        socket.close(); // Trigger reconnect
+    };
+}
+// Start connection immediately
+connectWS();
 
 // --- Logic ---
 function scheduleNextBlink(currentTime) {
@@ -131,7 +236,13 @@ function update(time) {
 
     // 2. Emotion & Gaze
     updateEmotion();
+    updateEmotion();
     updateGaze();
+
+    // Audio volume affects mouth curve slightly (talking simulation?)
+    if (audioState.volume > 0.1) {
+        // Optional: Add subtle mouth movement here if desired
+    }
 
     draw(eyeScaleY);
     requestAnimationFrame(update);
@@ -226,6 +337,7 @@ window.setEmotion = (valence, arousal) => {
 
 // Events
 window.addEventListener('resize', resize);
+window.addEventListener('click', initAudio);
 
 // Init
 resize();
