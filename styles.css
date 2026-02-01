@@ -1,12 +1,58 @@
-html, body {
+html,
+body {
     margin: 0;
     padding: 0;
     width: 100%;
     height: 100%;
     background-color: black;
     overflow: hidden;
+    font-family: monospace;
+    /* Tech feel */
 }
 
 canvas {
     display: block;
+}
+
+#status {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    color: #444;
+    /* Dark gray, subtle */
+    font-size: 12px;
+    pointer-events: none;
+    transition: color 0.3s;
+}
+
+/* Status States */
+.status-listening {
+    color: #4a4;
+}
+
+/* Greenish */
+.status-processing {
+    color: #eb4;
+    animation: pulse 1s infinite;
+}
+
+/* Yellowish */
+.status-speaking {
+    color: #4af;
+}
+
+/* Blueish */
+
+@keyframes pulse {
+    0% {
+        opacity: 0.5;
+    }
+
+    50% {
+        opacity: 1;
+    }
+
+    100% {
+        opacity: 0.5;
+    }
 }

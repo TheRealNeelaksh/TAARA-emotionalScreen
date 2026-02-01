@@ -1,7 +1,15 @@
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
 
 let width, height;
+
+function setStatus(text, type) {
+    statusEl.innerText = text.toUpperCase();
+    statusEl.className = '';
+    if (type) statusEl.classList.add(`status-${type}`);
+}
+
 
 // --- Configuration ---
 const EYE_RADIUS = 30;
@@ -103,6 +111,25 @@ async function initAudio() {
                 // Activity = slight positive valence (interested)
                 state.emotion.targetValence = lerp(state.emotion.targetValence, 0.2, 0.05);
             }
+            if (rms > 0.1) {
+                // Console log for voice debugging
+                // console.log("Voice Activity Detected (RMS):", rms); // Commented out to reduce spam
+
+                // Visual feedback: Only if we aren't already talking/thinking
+                const currentText = statusEl.innerText;
+                if (!currentText.includes("PROCESSING") && !currentText.includes("RESPONDING")) {
+                    setStatus("Hearing Sound...", "listening");
+
+                    // Debounce the reset to "Listening"
+                    clearTimeout(window.voiceTimeout);
+                    window.voiceTimeout = setTimeout(() => {
+                        const txt = statusEl.innerText;
+                        if (!txt.includes("PROCESSING") && !txt.includes("RESPONDING")) {
+                            setStatus("Listening", "listening");
+                        }
+                    }, 500);
+                }
+            }
         };
 
         source.connect(audioWorkletNode);
@@ -110,6 +137,7 @@ async function initAudio() {
 
         // Remove click handler
         window.removeEventListener('click', initAudio);
+        setStatus("Listening", "listening");
 
         // Visual feedback
         state.emotion.targetArousal = 1.0;
@@ -128,8 +156,7 @@ function connectWS() {
 
     socket.onopen = () => {
         console.log("WebSocket connected");
-        // Test message
-        socket.send("Hello from Frontend!");
+        setStatus("Connected (Click to Init Mic)", "listening");
     };
 
     socket.onmessage = (event) => {
@@ -137,12 +164,18 @@ function connectWS() {
             const data = JSON.parse(event.data);
             console.log("WS Recv:", data);
 
+            setStatus("Responding", "speaking");
+            setTimeout(() => setStatus("Listening", "listening"), 2000);
+
             if (data.delta_valence !== undefined) {
                 // Apply deltas
                 state.emotion.targetValence = Math.max(-1, Math.min(1, state.emotion.targetValence + data.delta_valence));
             }
             if (data.delta_arousal !== undefined) {
                 state.emotion.targetArousal = Math.max(0, Math.min(1, state.emotion.targetArousal + data.delta_arousal));
+            }
+            if (data.response_text) {
+                console.log("Baymax Says:", data.response_text);
             }
             // If text is present, maybe trigger usage? For now, just logging.
 
@@ -333,6 +366,16 @@ function draw(eyeScaleY) {
 window.setEmotion = (valence, arousal) => {
     state.emotion.targetValence = valence;
     state.emotion.targetArousal = arousal;
+};
+
+// Helper for user to chat
+window.say = (text) => {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        setStatus("Processing...", "processing");
+        socket.send(text);
+    } else {
+        console.warn("Socket not open");
+    }
 };
 
 // Events
