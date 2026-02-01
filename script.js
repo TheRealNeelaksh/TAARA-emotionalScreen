@@ -74,10 +74,21 @@ function resize() {
 // --- Audio State ---
 let audioContext;
 let audioWorkletNode;
+let inputMixer; // Mixes Mic and TTS for the visual engine
 let audioState = {
     volume: 0, // Smoothed RMS
     zcr: 0
 };
+// Recorder State
+let mediaRecorder;
+let audioChunks = [];
+let isRecording = false;
+let silenceStart = 0;
+let SILENCE_THRESHOLD = 0.03; // Threshold to stop recording
+let SILENCE_DURATION = 1500; // ms of silence before sending
+
+// Blink Sound
+const blinkSound = new Audio('src/voices/blink/blink.wav');
 
 async function initAudio() {
     if (audioContext) return;
@@ -87,9 +98,31 @@ async function initAudio() {
         await audioContext.audioWorklet.addModule('audio-processor.js');
 
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const source = audioContext.createMediaStreamSource(stream);
+        const micSource = audioContext.createMediaStreamSource(stream);
 
         audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
+
+        // Create Mixer
+        inputMixer = audioContext.createGain();
+
+        // Connect Mic -> Mixer -> Worklet
+        micSource.connect(inputMixer);
+        inputMixer.connect(audioWorkletNode);
+
+        // Initialize Recorder
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = (e) => {
+            if (e.data.size > 0) audioChunks.push(e.data);
+        };
+        mediaRecorder.onstop = () => {
+            const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                console.log("Sending Audio Blob...", audioBlob.size);
+                setStatus("Sending Audio...", "processing");
+                socket.send(audioBlob);
+            }
+            audioChunks = [];
+        };
 
         audioWorkletNode.port.onmessage = (event) => {
             const { rms, zcr } = event.data;
@@ -111,28 +144,41 @@ async function initAudio() {
                 // Activity = slight positive valence (interested)
                 state.emotion.targetValence = lerp(state.emotion.targetValence, 0.2, 0.05);
             }
-            if (rms > 0.1) {
-                // Console log for voice debugging
-                // console.log("Voice Activity Detected (RMS):", rms); // Commented out to reduce spam
 
-                // Visual feedback: Only if we aren't already talking/thinking
-                const currentText = statusEl.innerText;
-                if (!currentText.includes("PROCESSING") && !currentText.includes("RESPONDING")) {
-                    setStatus("Hearing Sound...", "listening");
+            // --- VAD Logic ---
+            // Debugging
+            // if (Math.random() < 0.05) console.log("RMS:", rms, "Rec:", isRecording);
 
-                    // Debounce the reset to "Listening"
-                    clearTimeout(window.voiceTimeout);
-                    window.voiceTimeout = setTimeout(() => {
-                        const txt = statusEl.innerText;
-                        if (!txt.includes("PROCESSING") && !txt.includes("RESPONDING")) {
-                            setStatus("Listening", "listening");
-                        }
-                    }, 500);
+            if (rms > SILENCE_THRESHOLD) {
+                // ACTIVE
+                silenceStart = performance.now(); // Reset silence timer
+
+                // Trigger Recording if loud enough (slightly higher threshold to start)
+                if (!isRecording && rms > SILENCE_THRESHOLD * 2) {
+                    isRecording = true;
+                    audioChunks = [];
+                    mediaRecorder.start();
+                    setStatus("Listening", "listening"); // Active UI update
+                    highlightStep('listening');
+                    console.log("STARTED RECORDING (RMS:", rms.toFixed(4), ")");
+                }
+            } else {
+                // SILENT
+                if (isRecording) {
+                    const silenceDuration = performance.now() - silenceStart;
+                    if (silenceDuration > SILENCE_DURATION) {
+                        // Stop Recording
+                        isRecording = false;
+                        mediaRecorder.stop();
+                        setStatus("Processing...", "processing");
+                        highlightStep('transcribing');
+                        console.log("STOPPED RECORDING (Silence:", silenceDuration.toFixed(0), "ms)");
+                    }
                 }
             }
         };
 
-        source.connect(audioWorkletNode);
+        // source.connect(audioWorkletNode); // Removed, using mixer now
         console.log("Audio initialized");
 
         // Remove click handler
@@ -148,6 +194,7 @@ async function initAudio() {
     }
 }
 
+
 // --- WebSocket ---
 let socket;
 
@@ -156,7 +203,8 @@ function connectWS() {
 
     socket.onopen = () => {
         console.log("WebSocket connected");
-        setStatus("Connected (Click to Init Mic)", "listening");
+        updateDebugStatus('backend-status', 'green');
+        setStatus("Connected to Baymax Core");
     };
 
     socket.onmessage = (event) => {
@@ -164,8 +212,20 @@ function connectWS() {
             const data = JSON.parse(event.data);
             console.log("WS Recv:", data);
 
-            setStatus("Responding", "speaking");
-            setTimeout(() => setStatus("Listening", "listening"), 2000);
+            // Handle Flow Status
+            // Handle Flow Status
+            if (data.status) {
+                if (data.status === 'generating_audio') {
+                    highlightStep('processing');
+                    if (data.response_text) {
+                        showSubtitle(data.response_text, false);
+                    }
+                } else if (data.status === 'speaking') {
+                    highlightStep('speaking');
+                } else {
+                    highlightStep(data.status);
+                }
+            }
 
             if (data.delta_valence !== undefined) {
                 // Apply deltas
@@ -174,10 +234,19 @@ function connectWS() {
             if (data.delta_arousal !== undefined) {
                 state.emotion.targetArousal = Math.max(0, Math.min(1, state.emotion.targetArousal + data.delta_arousal));
             }
+
+            // Subtitles
+            if (data.user_text) {
+                showSubtitle(data.user_text, true); // True = User
+            }
             if (data.response_text) {
                 console.log("Baymax Says:", data.response_text);
+                showSubtitle(data.response_text, false); // False = Baymax
             }
-            // If text is present, maybe trigger usage? For now, just logging.
+
+            if (data.audio) {
+                playAudioResponse(data.audio);
+            }
 
         } catch (e) {
             console.error("WS Parse Error", e);
@@ -186,11 +255,13 @@ function connectWS() {
 
     socket.onclose = () => {
         console.log("WebSocket closed, reconnecting...");
+        updateDebugStatus('backend-status', 'red');
         setTimeout(connectWS, RECONNECT_DELAY);
     };
 
     socket.onerror = (err) => {
         console.error("WebSocket error", err);
+        updateDebugStatus('backend-status', 'yellow');
         socket.close(); // Trigger reconnect
     };
 }
@@ -237,6 +308,10 @@ function update(time) {
     if (!state.blink.isBlinking && time >= state.blink.nextBlinkTime) {
         state.blink.isBlinking = true;
         state.blink.startTime = time;
+        // Play sound
+        blinkSound.currentTime = 0;
+        blinkSound.volume = 0.2; // Low volume
+        blinkSound.play().catch(e => { }); // Catch error if not interacted
     }
 
     let eyeScaleY = 1.0;
@@ -279,6 +354,41 @@ function update(time) {
 
     draw(eyeScaleY);
     requestAnimationFrame(update);
+}
+
+
+function playAudioResponse(base64Audio) {
+    if (!audioContext) return;
+
+    try {
+        const binaryString = window.atob(base64Audio);
+        const len = binaryString.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) {
+            bytes[i] = binaryString.charCodeAt(i);
+        }
+
+        audioContext.decodeAudioData(bytes.buffer, (buffer) => {
+            const source = audioContext.createBufferSource();
+            source.buffer = buffer;
+
+            // 1. Connect to Speakers (Hear it)
+            source.connect(audioContext.destination);
+
+            // 2. Connect to Visual Engine (See it)
+            // Use a specific gain to prevent it from being too overwhelming visually
+            const visualGain = audioContext.createGain();
+            visualGain.gain.value = 0.8;
+            source.connect(visualGain);
+            if (inputMixer) {
+                visualGain.connect(inputMixer);
+            }
+
+            source.start(0);
+        });
+    } catch (e) {
+        console.error("Audio Playback Error:", e);
+    }
 }
 
 function draw(eyeScaleY) {
@@ -378,10 +488,106 @@ window.say = (text) => {
     }
 };
 
-// Events
-window.addEventListener('resize', resize);
-window.addEventListener('click', initAudio);
+// --- Debug UI & Controls ---
+function updateDebugStatus(id, color) {
+    const el = document.getElementById(id);
+    if (el) {
+        el.className = `status-dot ${color}`;
+    }
+}
+
+function highlightStep(stepName) {
+    // Reset all
+    document.querySelectorAll('.flow-steps .step').forEach(el => el.classList.remove('active'));
+
+    // Map status from backend to ID
+    // transcribing -> step-transcribing
+    // llm_processing -> step-processing
+    // generating_audio -> step-processing (or keep highlighted)
+    // speaking -> step-speaking
+    // listening -> step-listening
+
+    let targetId = '';
+    if (stepName === 'listening') targetId = 'step-listening';
+    if (stepName === 'transcribing') targetId = 'step-transcribing';
+    if (stepName === 'llm_processing') targetId = 'step-processing';
+    if (stepName === 'generating_audio') targetId = 'step-processing'; // Still processing
+    if (stepName === 'speaking') targetId = 'step-speaking';
+
+    if (targetId) {
+        const el = document.getElementById(targetId);
+        if (el) el.classList.add('active');
+    }
+}
+
+function showSubtitle(text, isUser) {
+    const el = document.getElementById('subtitles');
+    if (!el) return;
+
+    el.innerText = text;
+    el.style.opacity = '1';
+    el.style.color = isUser ? '#aaa' : '#fff'; // User grey, Baymax bright
+
+    // Auto hide after some time if it's user text? keep until next interaction?
+    // Let's keep it visible for a bit.
+    if (window.subtitleTimeout) clearTimeout(window.subtitleTimeout);
+    window.subtitleTimeout = setTimeout(() => {
+        el.style.opacity = '0';
+    }, 5000 + (text.length * 50));
+}
+
+
+// --- Initialization ---
+const micToggle = document.getElementById('mic-toggle');
+const micLabel = document.getElementById('mic-label');
+
+micToggle.addEventListener('change', async (e) => {
+    if (e.target.checked) {
+        // Turn ON
+        await initAudio();
+        micLabel.innerText = "Mic On";
+        highlightStep('listening');
+    } else {
+        // Turn OFF
+        // Ideally we should stop the mediaStream tracks here to truly mute
+        // For now, initAudio sets isRecording=false on silence, but we might want manual control.
+        // We'll rely on the existing logic which toggles listening based on voice activity, 
+        // but maybe we should disable inputMixer?
+        micLabel.innerText = "Mic Off";
+        // To be safe, reload or just stop processing? 
+        // Let's just update label for now, as initAudio is idempotent-ish or hard to 'un-init' without reload.
+        // A simple way is to limit `mediaRecorder` starting only if checked.
+        // But initAudio() does a lot of setup. 
+    }
+});
+
+// Update initAudio to respect switch
+// We need to inject a check inside the existing audio loop
+// Or just let initAudio be called ONCE, and the toggle controls the "isAllowedToRecord" flag.
+
+let isMicEnabled = false;
+micToggle.addEventListener('change', (e) => {
+    isMicEnabled = e.target.checked;
+    micLabel.innerText = isMicEnabled ? "Mic On" : "Mic Off";
+    if (isMicEnabled && !audioContext) {
+        initAudio();
+    }
+});
+
+// Start Polls
+setInterval(async () => {
+    try {
+        const res = await fetch('http://localhost:8000/llm-status');
+        const data = await res.json();
+        if (data.status === 'connected') updateDebugStatus('llm-status', 'green');
+        else updateDebugStatus('llm-status', 'red');
+    } catch (e) {
+        console.warn("Poll Error", e);
+        updateDebugStatus('llm-status', 'red');
+    }
+}, 5000);
 
 // Init
 resize();
 requestAnimationFrame(update);
+

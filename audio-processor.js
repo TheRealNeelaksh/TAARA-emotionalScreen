@@ -40,12 +40,12 @@ class AudioProcessor extends AudioWorkletProcessor {
 
         // Post back to main thread
         // Only post if there's *some* sound to avoid flooding idle state
-        if (rms > 0.001) {
-            this.port.postMessage({
-                rms: rms,
-                zcr: zeroCrossings / channelData.length // Normalized ZCR
-            });
-        }
+        // Post back to main thread
+        // Always post to ensure main thread sees silence
+        this.port.postMessage({
+            rms: rms,
+            zcr: zeroCrossings / channelData.length // Normalized ZCR
+        });
 
         return true; // Keep processor alive
     }

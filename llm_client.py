@@ -3,11 +3,11 @@ import json
 
 # Configuration
 # LMStudio / OpenAI Compatible Endpoint
-LLM_URL = "http://localhost:11434/v1/chat/completions"
+LLM_URL = "http://127.0.0.1:11434/v1/chat/completions"
 
 SYSTEM_PROMPT = """You are Baymax, a personal healthcare companion. 
 Your traits: Calm, robotic but caring, minimal, gentle.
-Your responses must be short (under 20 words).
+Your responses must be VERY short (under 15 words).
 You must output ONLY valid JSON in this format:
 {
   "response_text": "Your spoken response here",
@@ -24,19 +24,28 @@ async def generate_response(user_input: str):
     ]
     
     payload = {
+        "model": "local-model", # Some endpoints require a model name
         "messages": messages,
         "temperature": 0.7,
-        "max_tokens": 100,
+        "max_tokens": 50, # Restricted to prevent overlap
         "stream": False
-        # "response_format": { "type": "json_object" }  <-- Caused 400 Error in some versions of LMStudio
     }
 
+    print(f"Sending prompt to LLM ({LLM_URL})...")
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(LLM_URL, json=payload, timeout=10.0)
+            try:
+                response = await client.post(LLM_URL, json=payload, timeout=30.0)
+            except httpx.ConnectError:
+                print("LLM Error: Connection Refused. Is LM Studio running and server started?")
+                return mock_response(user_input)
+            except httpx.ReadTimeout:
+                print("LLM Error: Read Timeout. Model is taking too long.")
+                return mock_response(user_input)
             
             if response.status_code == 200:
                 data = response.json()
+                print("LLM Response Received.")
                 # OpenAI format: choices[0].message.content
                 content = data["choices"][0]["message"]["content"]
                 
@@ -49,7 +58,7 @@ async def generate_response(user_input: str):
                     if continue_parsing: return continue_parsing
                     
                     return {
-                        "response_text": content[:100], 
+                        "response_text": content[:150], 
                         "delta_valence": 0,
                         "delta_arousal": 0
                     }
@@ -57,7 +66,7 @@ async def generate_response(user_input: str):
                 print(f"LLM Error {response.status_code}: {response.text}")
 
     except Exception as e:
-        print(f"LLM Connection Error: {e}")
+        print(f"LLM Critical Error: {type(e).__name__} - {e}")
         pass
     
     # --- Fallback (Mock Baymax) ---
@@ -78,11 +87,11 @@ def mock_response(text: str):
     text = text.lower()
     
     if "hello" in text or "hi" in text:
-        return {"response_text": "Hello. I am Baymax.", "delta_valence": 0.1, "delta_arousal": 0.1}
+        return {"response_text": "[MOCK] Hello. I am Baymax.", "delta_valence": 0.1, "delta_arousal": 0.1}
     elif "sad" in text or "hurt" in text or "pain" in text:
-        return {"response_text": "I am sensing you are in distress.", "delta_valence": -0.2, "delta_arousal": 0.0}
+        return {"response_text": "[MOCK] I am sensing you are in distress.", "delta_valence": -0.2, "delta_arousal": 0.0}
     elif "happy" in text or "good" in text:
-        return {"response_text": "I am pleased to hear that.", "delta_valence": 0.2, "delta_arousal": 0.1}
+        return {"response_text": "[MOCK] I am pleased to hear that.", "delta_valence": 0.2, "delta_arousal": 0.1}
     else:
-        return {"response_text": "I am listening.", "delta_valence": 0.0, "delta_arousal": 0.0}
+        return {"response_text": "[MOCK] I am listening.", "delta_valence": 0.0, "delta_arousal": 0.0}
 

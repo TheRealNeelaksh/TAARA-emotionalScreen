@@ -2,3 +2,9 @@ fastapi
 uvicorn
 websockets
 httpx
+pyttsx3
+openai-whisper
+numpy
+faster_whisper
+elevenlabs
+python-dotenv
