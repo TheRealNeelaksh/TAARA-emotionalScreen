@@ -3,109 +3,214 @@ const ctx = canvas.getContext('2d');
 
 let width, height;
 
-// Configuration
-// Adjust these to match the "Baymax" proportions
-const EYE_RADIUS = 30; 
+// --- Configuration ---
+const EYE_RADIUS = 30;
 const EYE_SPACING = 140; // Distance between centers
 const LINE_WIDTH = 4;
-const BLINK_DURATION = 150; // ms
+const LINE_MAX_CURVE = 20; // Max pixels the line curves up/down
+
+// Blink Config
+const BLINK_DURATION = 150;
 const MIN_BLINK_INTERVAL = 2000;
 const MAX_BLINK_INTERVAL = 6000;
 
-let blinkState = {
-    isBlinking: false,
-    startTime: 0,
-    nextBlinkTime: 0
+// Gaze Config
+const MAX_GAZE_OFFSET = 15; // Max pixels eyes can wander
+const GAZE_CHANGE_CHANCE = 0.01; // Per frame chance to change gaze target
+const GAZE_SMOOTHING = 0.05; // Lerp factor for gaze
+
+// Emotion Config
+const EMOTION_DECAY = 0.001; // Per frame decay to neutral
+const EMOTION_SMOOTHING = 0.05; // Lerp factor for emotion changes
+
+// --- State ---
+let state = {
+    // Blinking
+    blink: {
+        isBlinking: false,
+        startTime: 0,
+        nextBlinkTime: 0
+    },
+    // Emotion (-1 to 1)
+    emotion: {
+        currentValence: 0,
+        targetValence: 0,
+        currentArousal: 0,
+        targetArousal: 0
+    },
+    // Gaze (Offset from center)
+    gaze: {
+        currentX: 0,
+        currentY: 0,
+        targetX: 0,
+        targetY: 0
+    }
 };
+
+// --- Helpers ---
+function lerp(start, end, factor) {
+    return start + (end - start) * factor;
+}
 
 function resize() {
     width = window.innerWidth;
     height = window.innerHeight;
     canvas.width = width;
     canvas.height = height;
-    draw(1.0); // Redraw immediately on resize
 }
 
+// --- Logic ---
 function scheduleNextBlink(currentTime) {
-    const delay = Math.random() * (MAX_BLINK_INTERVAL - MIN_BLINK_INTERVAL) + MIN_BLINK_INTERVAL;
-    blinkState.nextBlinkTime = currentTime + delay;
+    // Arousal could decrease blink interval (more alert)
+    const arousalFactor = 1 - (state.emotion.currentArousal * 0.5); // 0.5 to 1.0 multiplier
+    const delay = (Math.random() * (MAX_BLINK_INTERVAL - MIN_BLINK_INTERVAL) + MIN_BLINK_INTERVAL) * arousalFactor;
+    state.blink.nextBlinkTime = currentTime + delay;
+}
+
+function updateEmotion() {
+    // Slowly decay targets to neutral
+    if (state.emotion.targetValence > 0) state.emotion.targetValence = Math.max(0, state.emotion.targetValence - EMOTION_DECAY);
+    if (state.emotion.targetValence < 0) state.emotion.targetValence = Math.min(0, state.emotion.targetValence + EMOTION_DECAY);
+    if (state.emotion.targetArousal > 0) state.emotion.targetArousal = Math.max(0, state.emotion.targetArousal - EMOTION_DECAY);
+
+    // Smoothly interpolate current emotion to target
+    state.emotion.currentValence = lerp(state.emotion.currentValence, state.emotion.targetValence, EMOTION_SMOOTHING);
+    state.emotion.currentArousal = lerp(state.emotion.currentArousal, state.emotion.targetArousal, EMOTION_SMOOTHING);
+}
+
+function updateGaze() {
+    // Randomly pick a new target
+    if (Math.random() < GAZE_CHANGE_CHANCE) {
+        // Biased slightly towards center
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * MAX_GAZE_OFFSET;
+        state.gaze.targetX = Math.cos(angle) * dist;
+        state.gaze.targetY = Math.sin(angle) * dist;
+    }
+
+    state.gaze.currentX = lerp(state.gaze.currentX, state.gaze.targetX, GAZE_SMOOTHING);
+    state.gaze.currentY = lerp(state.gaze.currentY, state.gaze.targetY, GAZE_SMOOTHING);
 }
 
 function update(time) {
-    if (blinkState.nextBlinkTime === 0) {
-        scheduleNextBlink(time);
-    }
+    // 1. Blinking
+    if (state.blink.nextBlinkTime === 0) scheduleNextBlink(time);
 
-    if (!blinkState.isBlinking && time >= blinkState.nextBlinkTime) {
-        blinkState.isBlinking = true;
-        blinkState.startTime = time;
+    if (!state.blink.isBlinking && time >= state.blink.nextBlinkTime) {
+        state.blink.isBlinking = true;
+        state.blink.startTime = time;
     }
 
     let eyeScaleY = 1.0;
 
-    if (blinkState.isBlinking) {
-        const elapsed = time - blinkState.startTime;
-        if (elapsed >= BLINK_DURATION) {
-            blinkState.isBlinking = false;
+    // Arousal can widen eyes slightly (rest scale > 1) or narrow (squint < 1)
+    // Let's say high arousal = slightly wider eyes normally
+    const baseScale = 1.0 + (state.emotion.currentArousal * 0.1);
+
+    if (state.blink.isBlinking) {
+        const elapsed = time - state.blink.startTime;
+        const duration = BLINK_DURATION; // Could scale with arousal too
+
+        if (elapsed >= duration) {
+            state.blink.isBlinking = false;
             scheduleNextBlink(time);
-            eyeScaleY = 1.0;
+            eyeScaleY = baseScale;
         } else {
-            // Simple ease-in-out or linear blink
-            // Full close at 50%
-            const progress = elapsed / BLINK_DURATION;
+            const progress = elapsed / duration;
             if (progress < 0.5) {
-                // Closing: 1.0 -> 0.1
-                eyeScaleY = 1.0 - (progress * 2 * 0.9);
+                // Close
+                eyeScaleY = lerp(baseScale, 0.1, progress * 2);
             } else {
-                // Opening: 0.1 -> 1.0
-                eyeScaleY = 0.1 + ((progress - 0.5) * 2 * 0.9);
+                // Open
+                eyeScaleY = lerp(0.1, baseScale, (progress - 0.5) * 2);
             }
         }
+    } else {
+        eyeScaleY = baseScale;
     }
-    
+
+    // 2. Emotion & Gaze
+    updateEmotion();
+    updateGaze();
+
     draw(eyeScaleY);
     requestAnimationFrame(update);
 }
 
 function draw(eyeScaleY) {
-    // Clear
     ctx.fillStyle = 'black';
     ctx.fillRect(0, 0, width, height);
 
     const centerX = width / 2;
     const centerY = height / 2;
 
-    // Draw Line (behind eyes, technically connecting centers)
-    // Baymax line connects the inner edges or centers? 
-    // Usually it looks like a line connecting the centers.
-    ctx.beginPath();
+    // Apply specific emotion effects
+    // Valence:
+    // +1 (Happy): Eyes move up slightly, Line curves up
+    // -1 (Sad): Eyes move down slightly, Line curves down
+    const valenceYOffset = state.emotion.currentValence * -10; // -10px for happy, +10px for sad
+
+    // Gaze affects everything
+    const offsetX = state.gaze.currentX;
+    const offsetY = state.gaze.currentY + valenceYOffset;
+
+    const leftEyeX = centerX - EYE_SPACING / 2 + offsetX;
+    const rightEyeX = centerX + EYE_SPACING / 2 + offsetX;
+    const eyesY = centerY + offsetY;
+
+    // --- Draw Line ---
+    // The line connects the inner edges? Or centers? 
+    // Baymax: simple straight line.
+    // Emotion: Curved line (quadratic bezier).
+
+    // Calculate control point for curve
+    // Valence controls the curve intensity.
+    // Line endpoints should anchor near the eyes.
+
     ctx.strokeStyle = '#FFFFFF';
     ctx.lineWidth = LINE_WIDTH;
     ctx.lineCap = 'round';
-    
-    // Line from center of left eye to center of right eye
-    // But we might want it to not overlap the eyes if fill is transparent? 
-    // Eyes are solid white, so line under is fine.
-    
-    ctx.moveTo(centerX - EYE_SPACING / 2, centerY);
-    ctx.lineTo(centerX + EYE_SPACING / 2, centerY);
+    ctx.beginPath();
+
+    // Start/End points: Centers of eyes
+    // To make it look "under" the eyes or connecting them?
+    // Let's connect the centers, but draw behind eyes.
+
+    const lineY = eyesY;
+    const midX = centerX + offsetX;
+
+    // Curve amount
+    const curveY = state.emotion.currentValence * LINE_MAX_CURVE;
+
+    ctx.moveTo(leftEyeX, lineY);
+    // Quadratic Curve: CP at (midX, lineY + curveY)
+    // Note: Canvas Y consumes downwards. 
+    // Smile: Curve needs to be "down" in pixels (higher Y value) to look like a U shape? 
+    // Wait, typical smile is U shape.
+    // ctx.quadraticCurveTo(ControlX, ControlY, EndX, EndY)
+
+    // If valence is +1 (Happy), we want a U shape (Smile). Control point Y should be GREATER than start/end Y.
+    // So curveY should be positive.
+
+    ctx.quadraticCurveTo(midX, lineY + curveY, rightEyeX, lineY);
     ctx.stroke();
 
-    // Draw Eyes
+
+    // --- Draw Eyes ---
     ctx.fillStyle = '#FFFFFF';
 
-    // Left Eye
+    // Left
     ctx.save();
-    ctx.translate(centerX - EYE_SPACING / 2, centerY);
+    ctx.translate(leftEyeX, eyesY);
     ctx.scale(1, eyeScaleY);
     ctx.beginPath();
     ctx.arc(0, 0, EYE_RADIUS, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
 
-    // Right Eye
+    // Right
     ctx.save();
-    ctx.translate(centerX + EYE_SPACING / 2, centerY);
+    ctx.translate(rightEyeX, eyesY);
     ctx.scale(1, eyeScaleY);
     ctx.beginPath();
     ctx.arc(0, 0, EYE_RADIUS, 0, Math.PI * 2);
@@ -113,6 +218,15 @@ function draw(eyeScaleY) {
     ctx.restore();
 }
 
+// --- Exposure for debugging/testing ---
+window.setEmotion = (valence, arousal) => {
+    state.emotion.targetValence = valence;
+    state.emotion.targetArousal = arousal;
+};
+
+// Events
 window.addEventListener('resize', resize);
+
+// Init
 resize();
 requestAnimationFrame(update);
