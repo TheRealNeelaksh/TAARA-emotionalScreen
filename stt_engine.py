@@ -50,7 +50,7 @@ def transcribe_audio_bytes(audio_bytes: bytes) -> str:
             
         print(f"STT: Processing {len(audio_bytes)} bytes...")
         # Transcribe
-        segments, info = model.transcribe(temp_filename, beam_size=1)
+        segments, info = model.transcribe(temp_filename, beam_size=1, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500))
         
         # Combine segments
         text = " ".join([segment.text for segment in segments]).strip()

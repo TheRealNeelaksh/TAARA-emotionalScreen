@@ -4,8 +4,14 @@ import random
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
+
+print("--- ENV CHECK ---")
+print(f"ELEVENLABS_API_KEY: {'FOUND' if os.getenv('ELEVENLABS_API_KEY') else 'MISSING'}")
+print(f"ELEVENLABS_VOICE_ID: {'FOUND' if os.getenv('ELEVENLABS_VOICE_ID') else 'MISSING'}")
+print("-----------------")
 
 app = FastAPI()
 
@@ -107,7 +113,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     # Run in thread
                     audio_b64 = await asyncio.to_thread(generate_audio_base64, response['response_text'])
                     if audio_b64:
+                        print(f"TTS: Audio generated ({len(audio_b64)} chars)")
                         response["audio"] = audio_b64
+                    else:
+                        print("TTS: Audio generation failed (returned None). Check tts_engine logs.")
                 
                 response["status"] = "speaking"
                 await websocket.send_text(json.dumps(response))

@@ -56,7 +56,9 @@ let state = {
         currentY: 0,
         targetX: 0,
         targetY: 0
-    }
+    },
+    // Audio State
+    isAISpeaking: false // Mutex for VAD
 };
 
 // --- Helpers ---
@@ -77,15 +79,23 @@ let audioWorkletNode;
 let inputMixer; // Mixes Mic and TTS for the visual engine
 let audioState = {
     volume: 0, // Smoothed RMS
-    zcr: 0
+    zcr: 0,
+    noiseFloor: 0.005, // Adaptive Noise Floor
+    isSpeech: false
 };
 // Recorder State
 let mediaRecorder;
 let audioChunks = [];
 let isRecording = false;
 let silenceStart = 0;
-let SILENCE_THRESHOLD = 0.03; // Threshold to stop recording
-let SILENCE_DURATION = 1500; // ms of silence before sending
+let SILENCE_DURATION = 800; // ms of silence before sending (Reduced from 1500ms)
+
+// Adaptive VAD Config
+const VAD_MIN_NOISE = 0.002;
+const VAD_MAX_NOISE = 0.1;
+const VAD_SNR_TRIGGER = 4.0;
+const VAD_SNR_SUSTAIN = 2.5; // Stricter: Need 2.5x noise to MAINTAIN (prev: 1.5)
+const NOISE_ALPHA = 0.01; // Adaptation speed
 
 // Blink Sound
 const blinkSound = new Audio('src/voices/blink/blink.wav');
@@ -127,7 +137,7 @@ async function initAudio() {
         audioWorkletNode.port.onmessage = (event) => {
             const { rms, zcr } = event.data;
 
-            // Fast attack, slow release smoothing for volume
+            // Fast attack, slow release smoothing for volume (Visuals Only)
             if (rms > audioState.volume) {
                 audioState.volume = lerp(audioState.volume, rms, 0.3); // Attack
             } else {
@@ -136,7 +146,19 @@ async function initAudio() {
 
             audioState.zcr = zcr;
 
-            // Map Audio to Emotion
+            // --- Adaptive VAD Logic ---
+
+            // 1. Update Noise Floor (slowly adapt if signal is low)
+            // We assume if we are not "in speech", we are in noise. But to be safe, 
+            // only adapt if signal is relatively low compared to current floor or just consistent.
+            // Simple approach: If RMS is low, pull noise floor towards it.
+            if (!isRecording && rms < audioState.noiseFloor * 3.0) {
+                audioState.noiseFloor = lerp(audioState.noiseFloor, rms, NOISE_ALPHA);
+                // Clamp
+                audioState.noiseFloor = Math.max(VAD_MIN_NOISE, Math.min(VAD_MAX_NOISE, audioState.noiseFloor));
+            }
+
+            // 2. Map Audio to Emotion (Visuals)
             // Volume -> Target Arousal
             const arousalTarget = Math.min(1.0, audioState.volume * 5.0);
             if (arousalTarget > 0.1) {
@@ -145,25 +167,43 @@ async function initAudio() {
                 state.emotion.targetValence = lerp(state.emotion.targetValence, 0.2, 0.05);
             }
 
-            // --- VAD Logic ---
-            // Debugging
-            // if (Math.random() < 0.05) console.log("RMS:", rms, "Rec:", isRecording);
+            // 3. VAD Triggers
+            const triggerLevel = audioState.noiseFloor * VAD_SNR_TRIGGER;
+            const sustainLevel = audioState.noiseFloor * VAD_SNR_SUSTAIN;
 
-            if (rms > SILENCE_THRESHOLD) {
-                // ACTIVE
-                silenceStart = performance.now(); // Reset silence timer
+            // Log occasionally
+            // if (Math.random() < 0.01) console.log(`RMS:${rms.toFixed(4)} Floor:${audioState.noiseFloor.toFixed(4)} Trig:${triggerLevel.toFixed(4)}`);
 
-                // Trigger Recording if loud enough (slightly higher threshold to start)
-                if (!isRecording && rms > SILENCE_THRESHOLD * 2) {
+            const isBlinking = state.blink.isBlinking;
+            const isSpeaking = state.isAISpeaking;
+
+            // GATE: Strictly ignore everything if AI is speaking
+            if (isSpeaking) {
+                if (isRecording) {
+                    isRecording = false;
+                    mediaRecorder.stop();
+                    setStatus("Canceled (AI Speaking)", "processing");
+                }
+                return;
+            }
+
+            if (!isBlinking && rms > triggerLevel) {
+                // DEFINITELY SPEECH
+                silenceStart = performance.now(); // Reset silence
+
+                if (!isRecording) {
                     isRecording = true;
                     audioChunks = [];
                     mediaRecorder.start();
-                    setStatus("Listening", "listening"); // Active UI update
+                    setStatus("Listening", "listening");
                     highlightStep('listening');
-                    console.log("STARTED RECORDING (RMS:", rms.toFixed(4), ")");
+                    console.log(`STARTED RECORDING (RMS:${rms.toFixed(4)} > ${triggerLevel.toFixed(4)})`);
                 }
+            } else if (!isBlinking && isRecording && rms > sustainLevel) {
+                // PROBABLY SPEECH (Sustain)
+                silenceStart = performance.now(); // Keep alive
             } else {
-                // SILENT
+                // SILENCE (or Blinking treated as silence to avoid trigger)
                 if (isRecording) {
                     const silenceDuration = performance.now() - silenceStart;
                     if (silenceDuration > SILENCE_DURATION) {
@@ -310,8 +350,8 @@ function update(time) {
         state.blink.startTime = time;
         // Play sound
         blinkSound.currentTime = 0;
-        blinkSound.volume = 0.2; // Low volume
-        blinkSound.play().catch(e => { }); // Catch error if not interacted
+        blinkSound.volume = 0.1; // Low volume (Reduced to prevent VAD trigger)
+        blinkSound.play().catch(e => { console.warn("Blink sound failed", e); });
     }
 
     let eyeScaleY = 1.0;
@@ -357,10 +397,25 @@ function update(time) {
 }
 
 
+let currentSource = null; // Track current audio source to stop if needed
+
 function playAudioResponse(base64Audio) {
     if (!audioContext) return;
 
     try {
+        // ENFORCE: Single Stream - Stop previous if running
+        if (currentSource) {
+            // CRITICAL: Remove onended listener so it doesn't trigger "finished" logic for the interrupted stream
+            currentSource.onended = null;
+            try { currentSource.stop(); } catch (e) { }
+            currentSource = null;
+        }
+
+        // State Management: START (Immediately lock mic)
+        state.isAISpeaking = true;
+        setStatus("Speaking...", "speaking");
+        highlightStep('speaking');
+
         const binaryString = window.atob(base64Audio);
         const len = binaryString.length;
         const bytes = new Uint8Array(len);
@@ -368,15 +423,22 @@ function playAudioResponse(base64Audio) {
             bytes[i] = binaryString.charCodeAt(i);
         }
 
+        console.log("Audio: Decoding", bytes.length, "bytes");
+
         audioContext.decodeAudioData(bytes.buffer, (buffer) => {
+            // Resume context if suspended (browser autoplay policy)
+            if (audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+
             const source = audioContext.createBufferSource();
             source.buffer = buffer;
+            currentSource = source; // Keep reference
 
             // 1. Connect to Speakers (Hear it)
             source.connect(audioContext.destination);
 
             // 2. Connect to Visual Engine (See it)
-            // Use a specific gain to prevent it from being too overwhelming visually
             const visualGain = audioContext.createGain();
             visualGain.gain.value = 0.8;
             source.connect(visualGain);
@@ -384,10 +446,25 @@ function playAudioResponse(base64Audio) {
                 visualGain.connect(inputMixer);
             }
 
+            source.onended = () => {
+                // State Management: END
+                state.isAISpeaking = false;
+                currentSource = null;
+                setStatus("Listening", "listening");
+                highlightStep('listening');
+                console.log("Audio Finished. Mic Reactive.");
+            };
+
             source.start(0);
+        }, (err) => {
+            console.error("Audio Decode Error:", err);
+            state.isAISpeaking = false; // Reset if decode fails
+            setStatus("Listening", "listening");
         });
     } catch (e) {
         console.error("Audio Playback Error:", e);
+        state.isAISpeaking = false; // Safety reset
+        setStatus("Listening", "listening");
     }
 }
 
